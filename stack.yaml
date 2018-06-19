@@ -1,0 +1,50 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+
+Parameters:
+  FunctionName:
+    Description: Name of Lambda function
+    Type: String
+
+  LambdaCodeBucket:
+    Type: String
+
+  LambdaCodeKey:
+    Type: String
+    Default: "ops/ecs/lifecycle-hook/ecs_lifecycle_hook-latest.zip"
+
+  LambdaSnsTopicArn:
+    Description: Topic ARN to subscribe to
+    Type: String
+
+  LambdaExecutionRole:
+    Description: Lambda function execution role
+    Type: String
+
+
+Resources:
+  LambdaFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Handler: "handler.lambda_handler"
+      Runtime: python3.6
+      CodeUri:
+        Bucket: !Ref LambdaCodeBucket
+        Key: !Ref LambdaCodeKey
+      FunctionName: !Ref FunctionName
+      Description: Deployed with SAM
+      MemorySize: 128
+      Timeout: 10
+      Role: !Ref LambdaExecutionRole
+      Tags:
+        team: apollo
+      Events:
+        LifecycleHookSns:
+          Type: SNS
+          Properties:
+            Topic: !Ref LambdaSnsTopicArn
+
+
+Outputs:
+  LambdaFunction:
+    Value: !Ref LambdaFunction
