@@ -1,15 +1,13 @@
-import importlib
 import logging
 import os
 import uuid
 
 import botocore
-import fixtures
 import pytest
 
+import fixtures
 import handler
 import exc
-from trythatagain import CaughtException
 
 
 @pytest.fixture
@@ -35,12 +33,11 @@ def sns_topic(mocker):
 
 
 def test_log_level():
-    assert handler.logger.level is logging.INFO
+    handler.setup_logger()
+    assert handler.logger.level is logging.WARNING
 
     os.environ['LOGLEVEL'] = 'DEBUG'
-    # we have to reload because this environ is eval'ed at module load time
-    importlib.reload(handler)
-
+    handler.setup_logger()
     assert handler.logger.level is logging.DEBUG
 
 
@@ -187,7 +184,6 @@ def test_lambda_handler_malformed_event(mocker):
     mocker.patch('handler.run')
 
     assert handler.lambda_handler({}, None) is "error"
-    assert handler.logger.error.call_count is 3
 
 
 def test_lambda_handler_successful_run(mocker):
@@ -211,7 +207,6 @@ def test_lambda_handler_successful_run(mocker):
 
 
 def test_lambda_handler_run_with_exception(mocker):
-    mocker.patch('handler.logger')
     mocker.patch('handler.run')
     mocker.patch('handler.sns')
 
@@ -223,8 +218,6 @@ def test_lambda_handler_run_with_exception(mocker):
 
     result = handler.lambda_handler(fixtures.termination_event, None)
 
-    # check log exception
-    handler.logger.exception.assert_called_once()
     # check republishing of event on exception
     mock_topic.publish.assert_called_once()
     # check handler returns "error"
@@ -232,16 +225,13 @@ def test_lambda_handler_run_with_exception(mocker):
 
 
 def test_run_message_body_bad_json():
-    with pytest.raises(CaughtException):
+    with pytest.raises(exc.JsonDecodeError):
         handler.run({'Message': ''}, None)
 
 
-def test_run_not_lifecycle_hook(mocker, sns_topic):
-    mocker.patch('handler.logger')
+def test_run_not_lifecycle_hook(sns_topic):
     result = handler.run(fixtures.non_lifecycle_message_json, sns_topic)
-
     assert result == 'error'
-    assert handler.logger.debug.call_count is 2
 
 
 def test_run_not_cluster_node(mocker, sns_topic):
@@ -265,6 +255,7 @@ def test_run_has_daemon_tasks(mocker, sns_topic):
     mocker.patch('handler.logger')
     mocker.patch('handler.Instance')
     mocker.patch('handler.AutoScalingGroup')
+    mocker.patch('handler.time.sleep')
 
     mock_node = mocker.Mock()
     mock_node.drain.side_effect = exc.EcsError('foobar')
@@ -279,6 +270,7 @@ def test_run_has_daemon_tasks(mocker, sns_topic):
     resp = handler.run(fixtures.termination_message_json, sns_topic)
 
     assert resp == 'ok'
+    handler.time.sleep.assert_called_once()
     mock_cluster.stop_daemon_tasks.assert_called_once()
     sns_topic.publish.assert_called_once()
     assert handler.AutoScalingGroup.call_count is 0
@@ -289,6 +281,7 @@ def test_lambda_no_tasks(mocker, sns_topic):
     mocker.patch('handler.logger')
     mocker.patch('handler.Instance')
     mocker.patch('handler.AutoScalingGroup')
+    mocker.patch('handler.time.sleep')
 
     mock_node = mocker.Mock()
     mock_node.drain.side_effect = exc.EcsError('foobar')
@@ -305,6 +298,7 @@ def test_lambda_no_tasks(mocker, sns_topic):
     resp = handler.run(fixtures.termination_message_json, sns_topic)
 
     assert resp == 'ok'
+    handler.time.sleep.assert_not_called()
     mock_asg.terminate.assert_called_once_with(
         '86799385-e46d-40b9-a393-6ff3da981d7e',
         'testing-ASGTerminateHook-11414UVQ4RWSR'

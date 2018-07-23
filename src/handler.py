@@ -11,17 +11,17 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
 
 import json
 import logging
 import os
 import re
+import time
 
 import boto3
 from botocore.exceptions import ClientError
-from voluptuous import Schema, Invalid, ALLOW_EXTRA
 from trythatagain import retry_exp_backoff
+from voluptuous import Schema, Invalid, ALLOW_EXTRA
 
 from exc import EcsError, JsonDecodeError
 
@@ -30,9 +30,7 @@ ecs = _session.client('ecs')
 ec2 = _session.resource('ec2')
 sns = _session.resource('sns')
 asg = _session.client('autoscaling')
-
-logger = logging.getLogger()
-logger.setLevel(getattr(logging, os.environ.get('LOGLEVEL', 'INFO')))
+logger = None
 
 event_schema = Schema({
     'Records': Schema([
@@ -59,12 +57,16 @@ class AutoScalingGroup(object):
         self.name = name
 
     def terminate(self, token, hook_name, action='CONTINUE'):
-        asg.complete_lifecycle_action(
+        logger.info(f'Completing lifecycle with action {action}')
+        logger.debug('Lifecycle action token %s', token)
+        logger.debug('Lifecycle hook name %s', hook_name)
+        resp = asg.complete_lifecycle_action(
             LifecycleActionToken=token,
             LifecycleActionResult=action,
             LifecycleHookName=hook_name,
             AutoScalingGroupName=self.name
         )
+        logger.debug('Colplete lifecycle action resp: %s', resp)
 
 
 class Instance(object):
@@ -96,6 +98,7 @@ class Instance(object):
 
     @property
     def is_ecs_cluster_node(self):
+        logger.info(f'Checking if instance {self.id} belongs to ECS cluster')
         if self.cluster_name is not None:
             return True
         return False
@@ -110,12 +113,14 @@ class EcsNode(object):
         return self._data[item]
 
     def drain(self):
+        logger.info(f'Draining node {self.id}')
         if self['status'] == 'ACTIVE':
-            ecs.update_container_instances_state(
+            resp = ecs.update_container_instances_state(
                 cluster=self._cluster.name,
                 containerInstances=[self['containerInstanceArn']],
                 status='DRAINING'
             )
+            logger.debug('Update container inst state resp: %s', resp)
         else:
             raise EcsError('Node status not ACTIVE')
 
@@ -130,13 +135,17 @@ class EcsCluster(object):
         self.terminating_node = None
 
     def get_node(self, instance):
+        logger.info(f'Getting ECS node for instance {instance.id}')
+
         list_resp = ecs.list_container_instances(
             cluster=self.name
         )
+        logger.debug('List container instances resp %s', list_resp)
         desc_resp = ecs.describe_container_instances(
             cluster=self.name,
             containerInstances=list_resp['containerInstanceArns']
         )
+        logger.debug('Describe container instances resp %s', desc_resp)
 
         for node in desc_resp['containerInstances']:
             if node['ec2InstanceId'] == instance.id:
@@ -152,6 +161,7 @@ class EcsCluster(object):
         )['taskArns']
 
     def stop_daemon_tasks(self, node):
+        logger.info(f'Stopping daemon tasks on node {node.id}')
         tasks = self.get_tasks(node)
 
         if tasks:
@@ -159,6 +169,8 @@ class EcsCluster(object):
                 cluster=self.name,
                 tasks=tasks
             )
+
+            logger.debug('Describe tasks resp: %s', desc_tasks_resp)
 
             for task in desc_tasks_resp['tasks']:
                 if task['startedBy'] == node.id:
@@ -170,6 +182,7 @@ class EcsCluster(object):
                         logger.error(f"Couldn't find task {task['taskArn']}")
 
     def only_daemon_tasks_remaining(self, node):
+        logger.info(f'Checking if only daemon tasks remain on node {node.id}')
         tasks = self.get_tasks(node)
 
         results = []
@@ -180,6 +193,8 @@ class EcsCluster(object):
                 tasks=tasks
             )
 
+            logger.debug('Describe tasks resp: %s', desc_tasks_resp)
+
             for task in desc_tasks_resp['tasks']:
                 if task['startedBy'] == node.id:
                     results.append(True)
@@ -189,19 +204,43 @@ class EcsCluster(object):
         return all(results)
 
 
-@retry_exp_backoff(retries=10)
+def setup_logger():
+    global logger
+    logging.basicConfig()
+    logger = logging.getLogger('lifecycle_hook')
+    loglevel = os.environ.get('LOGLEVEL', 'WARNING')
+    logger.setLevel(getattr(logging, loglevel))
+    logger.info(f'Set lambda log level to {loglevel}')
+
+    # this adjusts boto3 log level
+    root_logger = logging.getLogger()
+    root_loglevel = os.environ.get('ROOT_LOGLEVEL', 'WARNING')
+    root_logger.setLevel(getattr(logging, root_loglevel))
+    logger.info(f'Set root log level to {root_loglevel}')
+
+
+@retry_exp_backoff(retries=10, raise_for=JsonDecodeError)
 def run(sns_message, sns_topic):
+    logger.info('Processing event')
+
+    sleep_time = round(abs(int(os.environ.get('SLEEP_MS', 0)) / 1000), 1)
+    logger.debug(f'Configured sleep time is {sleep_time} seconds')
+
     try:
-        message_body = json.loads(sns_message['Message'])
+        logger.info('JSON decoding SNS message')
+        message = sns_message['Message']
+        logger.debug(message)
+        message_body = json.loads(message)
     except ValueError as e:
         raise JsonDecodeError(f'Could not JSON decode SNS message: {e}')
 
     # check if it's a lifecycle hook
     try:
+        logger.info('Checking if SNS message is a lifecycle hook')
         lifecycle_hook_schema(message_body)
     except Invalid as e:
-        logger.debug('Message was not a lifecycle hook')
-        logger.debug(e)
+        logger.info('Message was not a lifecycle hook')
+        logger.info(e)
         return "error"
 
     inst = Instance(message_body['EC2InstanceId'])
@@ -209,6 +248,8 @@ def run(sns_message, sns_topic):
     if not inst.is_ecs_cluster_node:
         logger.error(f'Instance {inst.id} does not belong to a cluster')
         return "error"
+    else:
+        logger.info(f'Instance {inst.id} node belongs to ECS cluster')
 
     cluster = EcsCluster(inst.cluster_name)
     node = cluster.get_node(inst)
@@ -221,7 +262,7 @@ def run(sns_message, sns_topic):
         node.drain()
     except EcsError as e:
         # node is already draining
-        logger.debug(e)
+        logger.info(e)
 
     # stop daemon takss after all other tasks have been stopped
     if cluster.only_daemon_tasks_remaining(node):
@@ -231,18 +272,24 @@ def run(sns_message, sns_topic):
 
     if node['runningTasksCount'] != 0:
         # publish message to SNS topic
-        logger.debug(
+        logger.info(
             f'Instance {inst.id} still has running tasks; '
             f'republishing message.'
         )
+
+        if sleep_time:
+            logger.info(f'Sleeping for {sleep_time} seconds')
+        time.sleep(sleep_time)
+
         sns_topic.publish(
             Subject=sns_message['Subject'],
             Message=sns_message['Message'],
         )
+
         return "ok"
 
-    logger.debug(f'All tasks on {cluster.name} are stopped')
-    logger.debug(f'Completing lifecycle for {inst.id}')
+    logger.info(f'All tasks on {cluster.name} are stopped')
+    logger.info(f'Completing lifecycle for {inst.id}')
     asg = AutoScalingGroup(message_body['AutoScalingGroupName'])
     asg.terminate(message_body['LifecycleActionToken'],
                   message_body['LifecycleHookName'])
@@ -251,13 +298,19 @@ def run(sns_message, sns_topic):
 
 
 def lambda_handler(event, context):
+    setup_logger()
+
     try:
+        logger.info('Validating incoming event schema')
+        logger.debug(json.dumps(event, indent=2))
         event_schema(event)
     except Invalid as e:
         logger.error('Malformed event')
         logger.error(e)
         logger.error(event)
         return "error"
+    else:
+        logger.info('Incoming event validated')
 
     topic_arn = event['Records'][0]['Sns']['TopicArn']
     sns_message = event['Records'][0]['Sns']
@@ -273,5 +326,3 @@ def lambda_handler(event, context):
             Message=sns_message['Message'],
         )
         return "error"
-
-    return "ok"
